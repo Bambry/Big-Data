@@ -1,0 +1,115 @@
+#Applied OLAP and Spark SQL on 2 million crime data of San Franscisco with the purpose of making travel suggestions and policy recommendations to police officers to reduce crimes. Preprocessed data through data cleaning.
+#Conducted segment analysis based on geographic and historic information. Using data visualizations, result shows the violent crimes take place the most in three districts and during off-hour peak. Also, juvenile diverted was used very infrequently though this could be a potential intervention to reduce crimes amongst juvenile as other evidence shows.   
+
+from csv import reader
+from pyspark.sql import Row 
+from pyspark.sql import SparkSession
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import seaborn as sb
+import matplotlib.pyplot as plt
+from ggplot import *
+import warnings
+
+import os
+os.environ["PYSPARK_PYTHON"] = "python3"
+
+#import urllib.request
+urllib.request.urlretrieve("https://data.sfgov.org/api/views/tmnf-yvry/rows.csv?accessType=DOWNLOAD", "/tmp/sf_03_18.csv")
+dbutils.fs.mv("file:/tmp/sf_03_18.csv", "dbfs:/laioffer/spark_hw1/data/sf_03_18.csv")
+display(dbutils.fs.ls("dbfs:/laioffer/spark_hw1/data/"))
+
+# data preprocessing 
+data_path = "dbfs:/laioffer/spark_hw1/data/sf_03_18.csv"
+crime_data_lines = sc.textFile(data_path)
+df_crimes = crime_data_lines.map(lambda line: [x.strip('"') for x in next(reader([line]))])
+
+header = df_crimes.first()
+print(header)
+
+crimes = df_crimes.filter(lambda x: x != header)
+display(crimes.take(3))
+print(crimes.count())
+
+#get dataframe and sql
+from pyspark.sql import SparkSession
+spark = SparkSession \
+    .builder \
+    .appName("crime analysis") \
+    .config("spark.some.config.option", "some-value") \
+    .getOrCreate()
+
+df_opt1 = spark.read.format("csv").option("header", "true").load(data_path)
+display(df_opt1)
+df_opt1.createOrReplaceTempView("sf_crime")
+
+#SQL and OLAP
+crimeDistrict = spark.sql("SELECT  PdDistrict, COUNT(*) AS Count FROM sf_crime GROUP BY PdDistrict ORDER BY Count DESC")
+display(crimeDistrict)
+
+#Summary: The chart describes the number of crimes each Sunday at SF downtown since 2016, grouped by month. SF downtown was defined as a retangular where X is between -122.4 and -122.397, and Y is between 37.77 and 37.8. The result shows periodic cycles, where the number of crimes usually peaks during January, May, and July, or about every three months. 
+crimebydowntown=spark.sql("""WITH S AS (SELECT Date, CAST(X as FLOAT) as XF, CAST(Y as FLOAT) as YF, COUNT(*) as Num
+                                        FROM sf_crime        
+                                        WHERE DayOfWeek='Sunday'
+                                        GROUP BY 1,2,3
+                                        ORDER BY 1,2,3)
+                                        SELECT CAST(SPLIT(Date,'/')[0] as INT) as Month, CAST(SPLIT(Date,'/')[2] as INT) as Year, SUM(Num)
+                                        FROM S
+                                        WHERE XF BETWEEN -122.4 AND -122.397 AND YF BETWEEN 37.77 AND 37.8                                  
+                                        GROUP BY 2,1
+                                        ORDER BY 2,1""")
+display(crimebydowntown.filter("Year>2015"))
+
+#Summary: the graph describes the number of crimes in each month of 2015,2016,2017,2018. Here I used a line graph where each line represents number of crimes in one year trended by month. Results showed that number of crimes during Oct 2016~Jan 2017 exceeds the same period of previous or latter year. If I were working with a travel agency and regard Oct to Jan as the holiday season, I would be interested to figure out why the number of crimes peak during Oct 2016 to Jan 2017 in particular. On the other hand, 2018 in general remained a pretty low number of crimes. This would be a good promotion point for travelling to SF.
+crimebymonth=spark.sql("""SELECT CAST(SPLIT(Date,'/')[0] as INT) as Month, CAST(SPLIT(Date,'/')[2] as INT) as Year, COUNT(CAST(SPLIT(Date,'/')[1] as INT))as Num 
+                           FROM sf_crime
+                           GROUP BY 1,2
+                           ORDER BY 2,1""")
+display(crimebymonth.filter("Year>2014"))
+
+#Summary: (Christmas Day of 2015~2017)Considering context of this question , I was only interested in certain types of serious/dangerous crimes that have the most impact on tourists.Based on the results, the theft is the biggest category of all these crimes. If you look closer to the hourly distribution, crimes took place mostly during the noon to midnight, especially during the meal time- from 11am to 12 pm, 17 pm to 19 pm are the period when assualt, theft happens the most. Also, the crimes still peak during midnight hours, so tourists are suggested to be careful when choosing to have a night out with friends/families.   
+
+crimebyhour=spark.sql("""SELECT Date, CAST(SPLIT(Time,':')[0] as INT) as Hour, Category, Count(*) 
+                           FROM sf_crime            
+                           GROUP BY 1,2,3
+                           ORDER BY 1 Desc,2,3""")
+
+display(crimebyhour.filter("Date in ('12/25/2017','12/25/2016','12/25/2015') AND Category in ('ASSAULT','BURGLARY','ROBBERY','KIDNAPPING')"))
+
+#Summary: I defined the dangerous district to be district that has the most crimes in violence crimes (assault, burglary, robbery, kidnapping) instead of property crimes.
+crimebydanger=spark.sql("""SELECT PdDistrict, Count(*) as Num
+                           FROM sf_crime  
+                           WHERE Category in ('ASSAULT','BURGLARY','ROBBERY','KIDNAPPING')
+                           GROUP BY PdDistrict 
+                           ORDER BY Num DESC
+                           LIMIT 3
+                           """)
+
+display(crimebydanger)
+
+#As result, Southern, Northern, and Mission are shown as the three most dangerous districts in San Franscisco. Looking at the crime's hourly distribution after 2014, its clear that the crime shows a bell curve when you consider 4am in the morning as the start point, then number of crime climbs to the peak around 6 pm and 7 pm. What contributes the most  is assult. This is contradictory to the assumption that later night or post midnight is when most violent crimes takes place. I assume this is because crimes take place during after-work commutes. I would suggest police to put their attention to the transportation stations.   
+crimebydangernext=spark.sql("""WITH R AS(SELECT Category, CAST(SPLIT(Date,'/')[2] as INT) as Year, CAST(SPLIT(Time,':')[0] as INT) as Hour,COUNT(*) as Num
+                           FROM sf_crime  
+                           WHERE Category in ('ASSAULT','BURGLARY','ROBBERY','KIDNAPPING')
+                           AND PdDistrict in ('SOUTHERN','MISSION','NORTHERN')
+                           GROUP BY 1,2,3)
+                           SELECT Category,Hour,Sum(Num)
+                           FROM R
+                           WHERE Year>2014
+                           GROUP BY Hour,Category
+                           ORDER BY 2,1
+                           """)
+display(crimebydangernext)
+
+#Summary: I'm interested in how police resolute cases involving juvenile. When I only looked at four different crimes (lanceny/theft, burglary, robbery and kidnapping), unfortunately percentage of cases using juvenile diverted (a decriminalizing process that still hold juvenile accoutable for their actions) is very low. I would suggest this be used more frequently especially amongst first time offenders/low risk youths. 
+percentresolution=spark.sql("""WITH R as (SELECT Category,Resolution,COUNT(Category) as Total, COUNT(Resolution) as ResSum
+                               FROM sf_crime
+                               GROUP BY 1,2
+                               )
+                               SELECT Category, Resolution, ResSum, SUM(Total) OVER (ORDER BY Category)as Tot,(ResSum/SUM(Total) OVER (ORDER BY Category))*100 AS Percentage
+                               FROM R
+                               WHERE Resolution NOT IN ('NONE','JUVENILE BOOKED') AND Category in ('LARCENY/THEFT','BURGLARY','ROBBERY','KIDNAPPING') AND Resolution LIKE 'JUVENILE%'
+                                                            
+                               """)
+display(percentresolution)
